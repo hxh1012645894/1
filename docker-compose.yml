@@ -1,0 +1,80 @@
+# ============================================================
+# Docker Compose 编排文件
+# 项目：注册管理平台（前后端分离）
+# 服务：frontend (Vue+Nginx) + backend (FastAPI)
+# ============================================================
+
+services:
+  # ============ 后端服务 ============
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: registration-backend
+    restart: unless-stopped
+
+    # 从 .env 文件加载环境变量（API 密钥等敏感配置）
+    # 注意：.env 文件应放置在项目根目录，且不应提交到版本控制
+    env_file:
+      - .env
+
+    # 仅暴露端口给 Docker 内部网络访问（不对外暴露）
+    # Nginx 反向代理将通过 registration-network 访问此端口
+    expose:
+      - "8001"
+
+    # 数据卷持久化配置
+    # 持久化上传目录、处理目录、日志和数据目录
+    # 注意：挂载目录而非单个文件，避免 Docker 创建错误类型的挂载点
+    volumes:
+      - ./uploads:/app/uploads
+      - ./processed:/app/processed
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+    # 健康检查配置
+    # 使用 Python 内置 urllib.request，无需额外依赖 requests 库
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 加入自定义网络
+    networks:
+      - registration-network
+
+  # ============ 前端服务 ============
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    container_name: registration-frontend
+    restart: unless-stopped
+
+    # 端口映射：内部 80 -> 外部 80
+    ports:
+      - "80:80"
+
+    # 依赖后端服务，等待健康检查通过后再启动
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    # 加入自定义网络
+    networks:
+      - registration-network
+
+# ============ 网络配置 ============
+networks:
+  registration-network:
+    driver: bridge
+    name: registration-network
+
+# ============ 数据卷说明 ============
+# 数据持久化通过服务级别的 volumes 配置实现：
+# - uploads:    用户上传的原始文件
+# - processed:  OCR 处理后的文件
+# - logs:       应用日志
+# - data:       SQLite 数据库文件目录（包含 records.db）

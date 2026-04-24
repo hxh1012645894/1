@@ -3,13 +3,13 @@
     <el-aside width="200px" style="background-color: #304156;">
       <div class="logo">注册管理平台</div>
       <el-menu
-        default-active="/upload"
+        default-active="/"
         router
         background-color="#304156"
         text-color="#bfcbd9"
         active-text-color="#409EFF"
       >
-        <el-menu-item index="/upload">批量上传解析</el-menu-item>
+        <el-menu-item index="/">批量上传解析</el-menu-item>
         <el-menu-item index="/records">批件台账查看</el-menu-item>
       </el-menu>
     </el-aside>

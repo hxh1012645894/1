@@ -29,6 +29,37 @@
       </el-col>
     </el-row>
 
+    <!-- 搜索框 -->
+    <el-row :gutter="20" class="search-row" v-if="hasData || searchKeyword">
+      <el-col :span="6">
+        <el-input
+          v-model="searchKeyword"
+          placeholder="搜索批件号、受理号、药品名称"
+          clearable
+          @keyup.enter="handleSearch"
+          @clear="handleSearch"
+        >
+          <template #append>
+            <el-button icon="Search" @click="handleSearch">搜索</el-button>
+          </template>
+        </el-input>
+      </el-col>
+      <el-col :span="6">
+        <el-select v-model="sortBy" placeholder="排序字段" @change="handleSortChange">
+          <el-option label="默认排序" value="id" />
+          <el-option label="批准日期" value="approval_date" />
+          <el-option label="到期时间" value="expiry_date" />
+          <el-option label="申请时间" value="apply_time" />
+        </el-select>
+      </el-col>
+      <el-col :span="4">
+        <el-select v-model="sortOrder" placeholder="排序方向" @change="handleSortChange">
+          <el-option label="降序 (最新)" value="desc" />
+          <el-option label="升序 (最早)" value="asc" />
+        </el-select>
+      </el-col>
+    </el-row>
+
     <!-- 空数据提示 -->
     <div v-if="!loading && !hasData" class="empty-state">
       <el-empty description="暂无批件数据，正在解析中..." :image-size="100">
@@ -47,6 +78,7 @@
       v-loading="loading"
       empty-text="暂无批件数据"
       :class="{ 'hidden-table': !hasData && !loading }"
+      @expand-change="handleExpand"
     >
       <el-table-column type="expand">
         <template #default="props">
@@ -82,7 +114,7 @@
       <el-table-column prop="product_name" label="药品名称" min-width="130" show-overflow-tooltip></el-table-column>
       <el-table-column prop="dosage" label="剂型" min-width="80" show-overflow-tooltip></el-table-column>
       <el-table-column prop="specification" label="规格" min-width="100" show-overflow-tooltip></el-table-column>
-      <el-table-column prop="registration_class" label="注册分类" min-width="90" show-overflow-tooltip></el-table-column>
+      <el-table-column prop="registration_class" label="注册/药品分类" min-width="100" show-overflow-tooltip></el-table-column>
       <el-table-column prop="application" label="申请事项" min-width="110" show-overflow-tooltip></el-table-column>
       <el-table-column prop="approval_date" label="批准日期" min-width="100"></el-table-column>
       <el-table-column prop="validity" label="有效期" min-width="80"></el-table-column>
@@ -124,6 +156,19 @@
       </el-table-column>
     </el-table>
 
+    <!-- 分页组件 -->
+    <el-row justify="end" class="pagination-row" v-if="hasData">
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        :total="totalRecords"
+        layout="total, sizes, prev, pager, next, jumper"
+        @size-change="handleSizeChange"
+        @current-change="handlePageChange"
+      />
+    </el-row>
+
     <!-- 修改对话框 -->
     <el-dialog
       v-model="editDialogVisible"
@@ -162,7 +207,7 @@
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="注册分类">
+            <el-form-item label="注册/药品分类">
               <el-input v-model="editForm.registration_class" />
             </el-form-item>
           </el-col>
@@ -257,6 +302,19 @@ const records = ref([])
 const loading = ref(false)
 const hasData = ref(false)
 
+// 搜索和分页
+const searchKeyword = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
+const totalRecords = ref(0)
+
+// 排序
+const sortBy = ref('id')
+const sortOrder = ref('desc')
+
+// 展开状态追踪
+const isAnyRowExpanded = ref(false)
+
 const stats = ref({
   totalFiles: 0,
   totalProducts: 0,
@@ -273,51 +331,26 @@ const editDialogVisible = ref(false)
 const editForm = ref({})
 const currentIndex = ref(0)
 
-// WebSocket 连接
-let socket = null
-
-// 新增：专门处理中文日期格式的辅助函数
-const parseValidDate = (dateStr) => {
-  if (!dateStr || dateStr === 'N/A') return null;
-  // 将 "2025年11月13日" 转换为标准的 "2025-11-13" 供 JS 解析
-  let standardStr = String(dateStr).replace(/年/g, '-').replace(/月/g, '-').replace(/日/g, '');
-  const d = new Date(standardStr);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-// 修改：使用新的日期解析逻辑
-const isExpiringSoon = (expiryDate) => {
-  const expiryDateObj = parseValidDate(expiryDate)
-  if (!expiryDateObj) return false
-
-  const now = new Date()
-  // 消除时分秒的干扰
-  now.setHours(0, 0, 0, 0)
-
-  const oneYearlater = new Date(now)
-  oneYearlater.setFullYear(now.getFullYear() + 1)
-
-  return expiryDateObj >= now && expiryDateObj <= oneYearlater
-}
-
-// 修改：使用新的日期解析逻辑
-const isExpired = (expiryDate) => {
-  const expiryDateObj = parseValidDate(expiryDate)
-  if (!expiryDateObj) return false
-
-  const now = new Date()
-  now.setHours(0, 0, 0, 0)
-
-  return expiryDateObj < now
-}
-
 // 修改：增加 silent 参数，如果是静默刷新则不显示 loading 动画
 const fetchRecords = async (silent = false) => {
   if (!silent) loading.value = true
   try {
-    const res = await axios.get('http://localhost:8001/api/records')
-    records.value = res.data
-    updateStats(records.value)
+    const res = await axios.get('/api/records', {
+      params: {
+        search: searchKeyword.value,
+        page: currentPage.value,
+        size: pageSize.value,
+        sort_by: sortBy.value,
+        sort_order: sortOrder.value
+      }
+    })
+    records.value = res.data.records
+    totalRecords.value = res.data.total
+
+    // 统计数据单独获取（不受分页影响）
+    const statsRes = await axios.get('/api/stats')
+    stats.value = statsRes.data
+    hasData.value = statsRes.data.totalFiles > 0
   } catch (error) {
     console.error("获取数据失败", error)
   } finally {
@@ -325,24 +358,65 @@ const fetchRecords = async (silent = false) => {
   }
 }
 
-const updateStats = (recordsData) => {
-  const totalFiles = recordsData.length
-  const totalProducts = new Set(recordsData.map(r => r.product_name).filter(name => name && name !== 'N/A')).size
-  const expiringSoon = recordsData.filter(r => isExpiringSoon(r.expiry_date)).length
-  const expired = recordsData.filter(r => isExpired(r.expiry_date)).length
+// 搜索处理
+const handleSearch = () => {
+  currentPage.value = 1  // 搜索时重置到第一页
+  fetchRecords()
+}
 
-  stats.value = {
-    totalFiles,
-    totalProducts,
-    expiringSoon,
-    expired
+// 排序变化处理
+const handleSortChange = () => {
+  currentPage.value = 1  // 排序时重置到第一页
+  fetchRecords()
+}
+
+// 分页大小变化
+const handleSizeChange = () => {
+  currentPage.value = 1  // 改变每页条数时重置到第一页
+  fetchRecords()
+}
+
+// 页码变化
+const handlePageChange = () => {
+  fetchRecords()
+}
+
+// 展开状态处理
+const handleExpand = (row, expandedRows) => {
+  isAnyRowExpanded.value = expandedRows.length > 0
+
+  if (isAnyRowExpanded.value) {
+    // 有展开的行，暂停轮询
+    stopPolling()
+  } else {
+    // 全部折叠，刷新一次并恢复轮询
+    fetchRecords(true)
+    startPolling()
   }
-  hasData.value = totalFiles > 0
+}
+
+// 轮询控制
+let pollTimer = null
+
+const startPolling = () => {
+  if (pollTimer) return
+  pollTimer = setInterval(() => {
+    if (!isAnyRowExpanded.value) {
+      fetchRecords(true)
+    }
+  }, 10000)
+}
+
+const stopPolling = () => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
 }
 
 const previewPdf = (filePath, title) => {
   if (!filePath) return
-  pdfUrl.value = `http://localhost:8001/api/preview?path=${encodeURIComponent(filePath)}`
+  pdfUrl.value = `/api/preview?path=${encodeURIComponent(filePath)}`
   dialogTitle.value = title
   dialogVisible.value = true
 }
@@ -367,9 +441,8 @@ const deleteRecord = async (recordId, rowIndex) => {
       cancelButtonText: '取消'
     })
 
-    await axios.delete(`http://localhost:8001/api/records/${recordId}`)
-    records.value.splice(rowIndex, 1)
-    updateStats(records.value)
+    await axios.delete(`/api/records/${recordId}`)
+    fetchRecords(true)  // 刷新数据
     ElMessage.success('删除成功')
   } catch (error) {
     // 用户取消删除或发生错误
@@ -388,9 +461,8 @@ const editRecord = (record, rowIndex) => {
 
 const saveEdit = async () => {
   try {
-    await axios.put(`http://localhost:8001/api/records/${editForm.value.id}`, editForm.value)
-    records.value[currentIndex.value] = { ...editForm.value }
-    updateStats(records.value)
+    await axios.put(`/api/records/${editForm.value.id}`, editForm.value)
+    fetchRecords(true)  // 刷新数据
     ElMessage.success('修改成功')
     editDialogVisible.value = false
   } catch (error) {
@@ -399,46 +471,16 @@ const saveEdit = async () => {
   }
 }
 
-// 初始化 WebSocket 连接
-const initWebSocket = () => {
-  socket = new WebSocket('ws://localhost:8001/ws')
-
-  socket.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data)
-      // 收到数据更新通知，静默刷新
-      if (data.type === 'data_updated') {
-        console.log('[WebSocket] 收到数据更新通知，自动刷新表格')
-        fetchRecords(true)
-      }
-    } catch (e) {
-      // 忽略非 JSON 消息
-    }
-  }
-
-  socket.onclose = () => {
-    console.log('[WebSocket] 连接已关闭，5 秒后尝试重连...')
-    setTimeout(initWebSocket, 5000)
-  }
-
-  socket.onerror = (error) => {
-    console.error('[WebSocket] 连接错误:', error)
-  }
-}
-
 onMounted(() => {
   // 首次加载带 loading 动画
   fetchRecords()
-  // 建立 WebSocket 连接，监听数据更新
-  initWebSocket()
+  // 开启定时轮询
+  startPolling()
 })
 
 onUnmounted(() => {
-  // 页面卸载时关闭 WebSocket 连接
-  if (socket) {
-    socket.close()
-    socket = null
-  }
+  // 页面卸载时清除定时器
+  stopPolling()
 })
 </script>
 
@@ -466,6 +508,14 @@ onUnmounted(() => {
 .stat-value {
   font-size: 28px;
   font-weight: bold;
+}
+/* 搜索框样式 */
+.search-row {
+  margin-bottom: 20px;
+}
+/* 分页样式 */
+.pagination-row {
+  margin-top: 20px;
 }
 /* 空数据状态样式 */
 .empty-state {

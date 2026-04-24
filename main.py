@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi import HTTPException
@@ -65,7 +65,13 @@ app.add_middleware(
 )
 
 # --- 数据库配置 (SQLite) ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///./records.db?journal_mode=WAL&synchronous=NORMAL"
+# Docker 环境下数据库存放在 /app/data 目录
+# 本地开发时使用 ./data 目录
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "records.db")
+
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}?journal_mode=WAL&synchronous=NORMAL"
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     connect_args={"check_same_thread": False}
@@ -86,7 +92,7 @@ class ApprovalRecord(Base):
     enterprise = Column(String)
     address = Column(String)
     owner = Column(String)
-    apply_no = Column(String)
+    application_no = Column(String)
     handle_no = Column(String)
     approval_no = Column(String)
     conclusion = Column(Text)
@@ -108,44 +114,6 @@ PROCESSED_DIR = os.path.abspath("./processed")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-# --- WebSocket 配置 ---
-class ConnectionManager:
-    """WebSocket 连接管理器"""
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-        self.connection_lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        async with self.connection_lock:
-            self.active_connections.append(websocket)
-        logger.info(f"[WebSocket] 新连接建立，当前连接数: {len(self.active_connections)}")
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-            logger.info(f"[WebSocket] 连接断开，当前连接数: {len(self.active_connections)}")
-
-    async def broadcast(self, message: dict):
-        """广播消息给所有连接"""
-        if not self.active_connections:
-            return
-        message_json = asyncio.create_task(asyncio.to_thread(lambda: __import__('json').dumps(message, ensure_ascii=False)))
-        await message_json
-        data = message_json.result()
-
-        # 复制连接列表以避免遍历时修改
-        async with self.connection_lock:
-            connections = self.active_connections.copy()
-
-        for connection in connections:
-            try:
-                await connection.send_text(data)
-            except Exception as e:
-                logger.error(f"[WebSocket] 发送消息失败: {e}")
-
-manager = ConnectionManager()
-
 # --- 服务配置 ---
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8001"))
@@ -153,36 +121,41 @@ PORT = int(os.getenv("PORT", "8001"))
 logger.info(f"[服务启动] API 服务初始化完成")
 logger.info(f"[服务配置] 上传目录: {UPLOAD_DIR}")
 logger.info(f"[服务配置] 处理目录: {PROCESSED_DIR}")
-logger.info(f"[服务配置] 数据库: records.db")
-logger.info(f"[服务配置] WebSocket: ws://localhost:{PORT}/ws")
+logger.info(f"[服务配置] 数据库: {DB_PATH}")
 
 # --- API 路由 ---
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    upload_type: str = Form("smart"),
+    background_tasks: BackgroundTasks = None
+):
     """处理批量上传的文件并入库（后台处理）"""
     logger.info("=" * 80)
     logger.info("[上传处理] 收到文件上传请求")
     logger.info(f"[上传处理] 上传文件数量: {len(files)}")
+    logger.info(f"[上传处理] 上传类型: {upload_type}")
 
     # 立即返回响应，后台处理文件
     result = {
         "message": "文件已接收，开始后台处理",
         "file_count": len(files),
-        "processing": True
+        "processing": True,
+        "upload_type": upload_type
     }
 
     # 将文件保存和处理放到后台任务
     if background_tasks is not None:
-        background_tasks.add_task(process_files_background, files)
+        background_tasks.add_task(process_files_background, files, upload_type)
 
     logger.info("[上传处理] 已接收文件，后台处理已启动")
     logger.info("=" * 80)
 
     return result
 
-async def process_files_background(files: List[UploadFile]):
+async def process_files_background(files: List[UploadFile], upload_type: str = "smart"):
     """后台处理上传的文件"""
-    logger.info("[后台处理] 开始后台文件处理")
+    logger.info(f"[后台处理] 开始后台文件处理，模式: {upload_type}")
 
     db = SessionLocal()
     total_processed = 0
@@ -202,51 +175,84 @@ async def process_files_background(files: List[UploadFile]):
 
                 logger.info(f"[后台处理] 文件保存完成，大小: {file_size} 字节")
 
-                # 如果是图片，套壳为PDF
+                # 如果是图片，转换为PDF
                 process_path = file_location
-                is_converted = False
                 if file.filename.lower().endswith(('.jpg', '.png', '.jpeg')):
-                    is_converted = True
                     process_path = os.path.join(UPLOAD_DIR, f"{os.path.splitext(file.filename)[0]}.pdf")
                     logger.info(f"[后台处理] 检测到图片文件，正在转换为 PDF: {process_path}")
 
                     img = Image.open(file_location)
                     img.convert("RGB").save(process_path)
+                    logger.info(f"[后台处理] PDF 转换完成")
 
-                    converted_size = os.path.getsize(process_path)
-                    logger.info(f"[后台处理] PDF 转换完成，大小: {converted_size} 字节")
+                # 根据上传类型区分处理逻辑
+                if upload_type == "attachment_only":
+                    # 纯附件模式：不调用 OCR 和 LLM，直接入库
+                    logger.info(f"[后台处理] 纯附件模式，直接入库（不解析）")
 
-                # 提取核心数据
-                logger.info(f"[后台处理] 开始进行批件信息提取...")
-                records = process_single_file(process_path, PROCESSED_DIR)
-
-                # 存入数据库
-                inserted_count = 0
-                for rec in records:
+                    # 直接使用 uploads 目录中的文件路径
                     db_record = ApprovalRecord(
-                        product_name=rec.get("产品名称"), file_title=rec.get("文件标题"),
-                        specification=rec.get("规格"), dosage=rec.get("剂型"),
-                        application=rec.get("申请事项"), registration_class=rec.get("注册分类"),
-                        applicant=rec.get("申请人"), enterprise=rec.get("生产企业"),
-                        address=rec.get("生产地址"), owner=rec.get("上市许可持有人"),
-                        apply_no=rec.get("申请号"), handle_no=rec.get("受理号"),
-                        approval_no=rec.get("批件号"), conclusion=rec.get("审批结论"),
-                        drug_approval_no=rec.get("药品批准文号"), drug_standard_no=rec.get("药品标准编号"),
-                        apply_time=rec.get("申请时间"), handle_time=rec.get("受理时间"),
-                        approval_date=rec.get("批准日期"), validity=rec.get("有效期"),
-                        expiry_date=rec.get("到期时间"),
-                        main_file_path=rec.get("main_file_path"), attach_file_path=rec.get("attach_file_path")
+                        product_name=file.filename,  # 文件名作为产品名称，方便搜索
+                        file_title="纯附件",
+                        specification="N/A",
+                        dosage="N/A",
+                        application="N/A",
+                        registration_class="N/A",
+                        applicant="N/A",
+                        enterprise="N/A",
+                        address="N/A",
+                        owner="N/A",
+                        application_no="N/A",
+                        handle_no="N/A",
+                        approval_no="N/A",
+                        conclusion="N/A",
+                        drug_approval_no="N/A",
+                        drug_standard_no="N/A",
+                        apply_time="N/A",
+                        handle_time="N/A",
+                        approval_date="N/A",
+                        validity="N/A",
+                        expiry_date="N/A",
+                        main_file_path=process_path,  # 直接使用 uploads 目录中的文件
+                        attach_file_path=""
                     )
                     db.add(db_record)
-                    inserted_count += 1
+                    db.commit()
+                    total_processed += 1
+                    logger.info(f"[后台处理] 纯附件入库成功: {file.filename}")
 
-                db.commit()
-                total_processed += inserted_count
-
-                if inserted_count > 0:
-                    logger.info(f"[后台处理] 成功入库 {inserted_count} 条记录")
                 else:
-                    logger.warning(f"[后台处理] 未提取到有效数据，未入库任何记录")
+                    # 智能解析模式：调用 OCR 和 LLM
+                    logger.info(f"[后台处理] 智能解析模式，开始进行批件信息提取...")
+                    records = process_single_file(process_path, PROCESSED_DIR)
+
+                    # 存入数据库
+                    inserted_count = 0
+                    for rec in records:
+                        db_record = ApprovalRecord(
+                            product_name=rec.get("产品名称"), file_title=rec.get("文件标题"),
+                            specification=rec.get("规格"), dosage=rec.get("剂型"),
+                            application=rec.get("申请事项"), registration_class=rec.get("注册/药品分类"),
+                            applicant=rec.get("申请人"), enterprise=rec.get("生产企业"),
+                            address=rec.get("生产地址"), owner=rec.get("上市许可持有人"),
+                            application_no=rec.get("申请号"), handle_no=rec.get("受理号"),
+                            approval_no=rec.get("批件号"), conclusion=rec.get("审批结论"),
+                            drug_approval_no=rec.get("药品批准文号"), drug_standard_no=rec.get("药品标准编号"),
+                            apply_time=rec.get("申请时间"), handle_time=rec.get("受理时间"),
+                            approval_date=rec.get("批准日期"), validity=rec.get("有效期"),
+                            expiry_date=rec.get("到期时间"),
+                            main_file_path=rec.get("main_file_path"), attach_file_path=rec.get("attach_file_path")
+                        )
+                        db.add(db_record)
+                        inserted_count += 1
+
+                    db.commit()
+                    total_processed += inserted_count
+
+                    if inserted_count > 0:
+                        logger.info(f"[后台处理] 成功入库 {inserted_count} 条记录")
+                    else:
+                        logger.warning(f"[后台处理] 未提取到有效数据，未入库任何记录")
 
             except Exception as e:
                 logger.error(f"[后台处理] 文件 {file.filename} 处理失败: {e}")
@@ -255,15 +261,6 @@ async def process_files_background(files: List[UploadFile]):
 
         logger.info(f"[后台处理] 所有文件处理完成，总计入库: {total_processed} 条记录")
 
-        # 广播数据更新通知
-        logger.info(f"[WebSocket] 广播数据更新通知")
-        await manager.broadcast({
-            "type": "data_updated",
-            "message": "新数据已入库",
-            "count": total_processed,
-            "timestamp": datetime.now().isoformat()
-        })
-
     finally:
         db.close()
 
@@ -271,14 +268,45 @@ async def process_files_background(files: List[UploadFile]):
     logger.info(f"[后台处理] 处理完成：成功 {len(files) - len(failed_files)} 个，失败 {len(failed_files)} 个")
 
 @app.get("/api/records")
-def get_records():
-    """获取所有台账记录"""
-    logger.info("[查询处理] 获取所有批件记录")
+def get_records(search: str = "", page: int = 1, size: int = 10, sort_by: str = "id", sort_order: str = "desc"):
+    """获取台账记录，支持搜索、分页和排序"""
+    logger.info(f"[查询处理] 获取批件记录 - 搜索: '{search}', 页码: {page}, 每页: {size}, 排序: {sort_by} {sort_order}")
     db = SessionLocal()
     try:
-        records = db.query(ApprovalRecord).order_by(ApprovalRecord.id.desc()).all()
-        logger.info(f"[查询处理] 共查询到 {len(records)} 条记录")
-        return records
+        query = db.query(ApprovalRecord)
+
+        # 搜索条件：批件号、受理号、药品名称模糊匹配
+        if search:
+            search_pattern = f"%{search}%"
+            query = query.filter(
+                (ApprovalRecord.approval_no.like(search_pattern)) |
+                (ApprovalRecord.handle_no.like(search_pattern)) |
+                (ApprovalRecord.product_name.like(search_pattern))
+            )
+
+        # 获取总数
+        total = query.count()
+
+        # 排序逻辑
+        sort_column = getattr(ApprovalRecord, sort_by, ApprovalRecord.id)
+        if sort_order == "asc":
+            query = query.order_by(sort_column.asc())
+        else:
+            query = query.order_by(sort_column.desc())
+
+        # 分页
+        offset = (page - 1) * size
+        records = query.offset(offset).limit(size).all()
+
+        logger.info(f"[查询处理] 搜索匹配 {total} 条记录，返回第 {page} 页 ({len(records)} 条)")
+
+        return {
+            "records": records,
+            "total": total,
+            "page": page,
+            "size": size,
+            "totalPages": (total + size - 1) // size if total > 0 else 0
+        }
     except Exception as e:
         logger.error(f"[查询处理] 查询失败: {e}")
         return {"error": str(e)}
@@ -344,16 +372,6 @@ def update_record(record_id: int, record: RecordUpdate):
         db.refresh(db_record)
         logger.info(f"[更新处理] 成功更新记录 ID: {record_id}")
 
-        # 广播数据更新通知
-        logger.info(f"[WebSocket] 广播数据更新通知")
-        import asyncio
-        asyncio.create_task(manager.broadcast({
-            "type": "data_updated",
-            "message": "数据已更新",
-            "count": 1,
-            "timestamp": datetime.now().isoformat()
-        }))
-
         return {"message": "更新成功", "data": db_record}
     except Exception as e:
         logger.error(f"[更新处理] 更新失败: {e}")
@@ -363,7 +381,7 @@ def update_record(record_id: int, record: RecordUpdate):
         db.close()
 
 def parse_date(date_str):
-    """提取字符串中的日期，支持 '2025年11月13日' 或 '2025-11-13'"""
+    """提取字符串中的日期，支持 '2025-11-13' 或 '2025年11月13日'"""
     match = re.search(r'(\d{4})[-年/.]\s*(\d{1,2})\s*[-月/.]\s*(\d{1,2})', str(date_str))
     if match:
         try:
@@ -455,23 +473,6 @@ def preview_file(path: str):
 def health_check():
     """健康检查"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 端点 - 实时推送数据更新通知"""
-    await manager.connect(websocket)
-    try:
-        while True:
-            # 接收客户端消息（用于心跳保持连接）
-            data = await websocket.receive_text()
-            # 可以处理客户端发送的指令，如：Heartbeat, RequestUpdate 等
-            if data == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"[WebSocket] 连接异常: {e}")
-        manager.disconnect(websocket)
 
 if __name__ == "__main__":
     import uvicorn

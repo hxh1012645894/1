@@ -22,6 +22,32 @@ logger = logging.getLogger("批件处理")
 logger.setLevel(logging.DEBUG)
 logger.propagate = False  # 防止日志传播到根 logger
 
+# 日期字段列表（需要统一格式化为 YYYY-MM-DD）
+DATE_FIELDS = ["申请时间", "受理时间", "批准日期", "有效期", "到期时间"]
+
+def normalize_date(date_str):
+    """将日期字符串统一格式化为 YYYY-MM-DD 格式"""
+    if not date_str or date_str == "N/A":
+        return date_str
+
+    # 支持的格式: 2025年11月13日, 2025/11/13, 2025.11.13, 2025-11-13
+    patterns = [
+        r'(\d{4})年(\d{1,2})月(\d{1,2})日',  # 中文格式
+        r'(\d{4})[/.](\d{1,2})[/.](\d{1,2})',  # 斜杠/点格式
+        r'(\d{4})-(\d{1,2})-(\d{1,2})'  # 已经是标准格式
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, date_str)
+        if match:
+            year = match.group(1)
+            month = match.group(2).zfill(2)  # 补零
+            day = match.group(3).zfill(2)  # 补零
+            return f"{year}-{month}-{day}"
+
+    # 无法解析的格式，返回原值
+    return date_str
+
 # 只在没有 handler 时才添加（避免多次调用时重复添加）
 if not logger.handlers:
     # 文件处理器
@@ -57,7 +83,7 @@ LLM_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
 LLM_MODEL = os.getenv("LLM_MODEL")
 
 TARGET_FIELDS = [
-    "产品名称", "文件标题", "规格", "剂型", "申请事项", "注册分类", "申请人",
+    "产品名称", "文件标题", "规格", "剂型", "申请事项", "注册/药品分类", "申请人",
     "生产企业", "生产地址", "上市许可持有人", "申请号", "受理号", "批件号",
     "审批结论", "药品批准文号", "药品标准编号", "申请时间", "受理时间", "批准日期", "有效期", "到期时间"
 ]
@@ -212,16 +238,7 @@ def process_single_file(filepath, output_folder):
     current_proj = None
     main_doc_count = 0
 
-    # 拆分逻辑 - 先并行提取所有页面的 OCR，再顺序分析
-    logger.info("[文档拆分] 开始页面分析和文档拆分...")
-
-    # 扩展的批件标题关键词（新药证书作为附件处理，单独"证书"不识别为主文档）
-    batch_title_keywords = [
-        '药物临床试验批件', '临床试验批件', '药品补充申请批件', '补充申请批件',
-        '药品注册证书', '注册证书', '药品再注册批件', '再注册批件',
-        '药品再注册批准通知书', '再注册批准通知书', '审批意见通知件',
-        '药物临床试验批准通知书', '临床试验通知书', '批件', '通知书', '通知件'
-    ]
+    # 拆分逻辑 - 先并行提取所有页面的 OCR，再构建项目
 
     # 步骤1: 并行提取所有页面的 OCR（最多 3 个并发）
     logger.info(f"[OCR并行] 开始并行提取 {total_pages} 页文本 (并发数: 3)...")
@@ -249,60 +266,32 @@ def process_single_file(filepath, output_folder):
 
     logger.info(f"[OCR并行] 完成，共提取 {len(page_texts)} 页文本")
 
-    # 步骤2: 顺序分析每个页面并构建项目
-    for page_num in range(1, total_pages + 1):
-        page_text = page_texts.get(page_num, "")
+    # 步骤2: 简化拆分逻辑 - 第一页作为主文件，后续页面作为附件
+    # 构建单个项目
+    first_page_text = page_texts.get(1, "")
+    doc_title = "批件"  # 默认标题
 
-        header_text = page_text[:1000].replace(" ", "").replace("\n", "")
+    # 尝试从第一页提取标题
+    header_text = first_page_text[:1000].replace(" ", "").replace("\n", "")
+    title_pattern = r'(药物临床试验批件|临床试验批件|药品补充申请批件|补充申请批件|药品注册证书|注册证书|药品再注册批件|再注册批件|药品再注册批准通知书|再注册批准通知书|审批意见通知件|药物临床试验批准通知书|临床试验通知书|备案信息|备案公示|批件|通知书|通知件)'
+    is_title = re.search(title_pattern, header_text)
+    if is_title:
+        doc_title = is_title.group(1)
+        logger.debug(f"[页面 1] 匹配到标题类型: {doc_title}")
 
-        # 检查是否包含药监局信息
-        is_nmpa = re.search(r'国家.*?(监督管理|药监).*?局', header_text)
+    # 构建项目：第一页为主文件，后续页面为附件
+    current_proj = {
+        "标题": doc_title,
+        "主页码": [1],
+        "附件页码": list(range(2, total_pages + 1)) if total_pages > 1 else [],
+        "主文本": first_page_text
+    }
+    projects.append(current_proj)
 
-        # 检查是否包含批件标题关键词
-        found_keyword = None
-        for keyword in batch_title_keywords:
-            if keyword in header_text:
-                found_keyword = keyword
-                break
-
-        # 判断是否是新的主文档开始
-        # 触发条件：
-        # 1. 包含批件标题关键词 + (药监局 OR "批件" OR "通知书")
-        # 2. 或者匹配到明确的标题类型
-        is_main_doc = False
-        doc_title = ""
-
-        # 检查是否匹配到明确的标题类型（保留"证书"类型）
-        title_pattern = r'(药物临床试验批件|临床试验批件|药品补充申请批件|补充申请批件|药品注册证书|注册证书|药品再注册批件|再注册批件|药品再注册批准通知书|再注册批准通知书|审批意见通知件|药物临床试验批准通知书|临床试验通知书|备案信息|备案公示)'
-        is_title = re.search(title_pattern, header_text)
-
-        if is_title:
-            is_main_doc = True
-            doc_title = is_title.group(1)
-            logger.debug(f"[页面 {page_num}] 匹配到标题类型: {doc_title}")
-        elif found_keyword and (is_nmpa or re.search(r'(批件|证书|通知书|通知件|备案)', header_text)):
-            # 如果找到关键词并且有批件相关标识
-            is_main_doc = True
-            # 尝试提取完整的标题
-            title_match = re.search(rf'(.{{0,20}}{re.escape(found_keyword)})', header_text)
-            if title_match:
-                doc_title = title_match.group(1)[:30]
-            else:
-                doc_title = found_keyword
-            logger.debug(f"[页面 {page_num}] 通过关键词识别: {found_keyword}")
-
-        if is_main_doc:
-            main_doc_count += 1
-            if current_proj:
-                projects.append(current_proj)
-            current_proj = {"标题": doc_title, "主页码": [page_num], "附件页码": [], "主文本": page_text}
-            logger.info(f"[批件识别] 第 {main_doc_count} 个主文档，标题: {doc_title} (页面 {page_num})")
-        elif current_proj:
-            current_proj["附件页码"].append(page_num)
-            logger.debug(f"[页面 {page_num}] 归入附件页")
-
-    if current_proj:
-        projects.append(current_proj)
+    main_doc_count = 1
+    logger.info(f"[批件识别] 第 {main_doc_count} 个主文档，标题: {doc_title} (页面 1)")
+    if current_proj["附件页码"]:
+        logger.info(f"[附件识别] 附件页码: {current_proj['附件页码']}")
 
     logger.info(f"[文档拆分] 完成，共识别 {len(projects)} 个批件项目")
 
@@ -324,7 +313,7 @@ def process_single_file(filepath, output_folder):
         # 构建提示词
         prompt = f"请从以下医药批件文本中，严格提取 21 个字段。如果没有对应信息输出 'N/A'。\n格式必须完全如下：\n" + \
                  "\n".join([f"{f}:[提取内容]" for f in TARGET_FIELDS]) + f"\n\n批件文本：\n{proj['主文本']}\n\n" + \
-                 f"注意：请根据理解【批准日期】和【有效期】字段计算【到期时间】。" 
+                 f"注意：\n1. 请根据理解【批准日期】和【有效期】字段计算【到期时间】。\n2. 所有日期字段（申请时间、受理时间、批准日期、有效期、到期时间）请统一格式化为 YYYY-MM-DD 格式，例如 2025-11-13。" 
                 
         # 调用大模型
         llm_res = call_llm(prompt, batch_index=idx, total_batches=len(projects)).replace('：', ':')
@@ -333,11 +322,20 @@ def process_single_file(filepath, output_folder):
             logger.error(f"[数据提取] 项目 {idx} 大模型返回空结果，跳过")
             continue
 
+        logger.debug(f"[LLM响应] 原始内容:\n{llm_res}")
+
         # 解析结果
         record_data = {}
         for field in TARGET_FIELDS:
             match = re.search(rf"{field}:(.+)", llm_res)
-            record_data[field] = match.group(1).strip() if match else "N/A"
+            value = match.group(1).strip() if match else ""
+            # 空内容转为 N/A
+            record_data[field] = value if value else "N/A"
+
+        # 统一日期字段格式为 YYYY-MM-DD
+        for field in DATE_FIELDS:
+            if field in record_data:
+                record_data[field] = normalize_date(record_data[field])
 
         # 检查是否有有效内容
         has_content = any(v != "N/A" and v.strip() != "" for k, v in record_data.items() if k != "文件标题")
