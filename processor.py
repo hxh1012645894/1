@@ -77,8 +77,7 @@ TEXTIN_APP_ID = os.getenv("TEXTIN_APP_ID")
 TEXTIN_SECRET_CODE = os.getenv("TEXTIN_SECRET_CODE")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 
-# LLM API URL 固定配置
-LLM_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
+LLM_API_URL = os.getenv("LLM_API_URL")
 
 LLM_MODEL = os.getenv("LLM_MODEL")
 
