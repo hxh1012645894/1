@@ -3,7 +3,7 @@
 ## 项目结构
 
 ```
-胡涛/
+批件注册/
 ├── backend/          # 后端 FastAPI 项目
 │   ├── main.py       # FastAPI 入口文件
 │   ├── processor.py  # 核心处理逻辑
