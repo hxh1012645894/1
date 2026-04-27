@@ -3,13 +3,13 @@
 # 项目：注册管理平台（前后端分离）
 # 服务：frontend (Vue+Nginx) + backend (FastAPI)
 # ============================================================
-
+name: registration
 services:
   # ============ 后端服务 ============
   backend:
     build:
       context: .
-      dockerfile: backend/Dockerfile
+      dockerfile: Dockerfile
     container_name: registration-backend
     restart: unless-stopped
 
