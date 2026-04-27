@@ -8,7 +8,6 @@ import shutil
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 加载 .env 配置文件
 load_dotenv()
@@ -239,31 +238,18 @@ def process_single_file(filepath, output_folder):
 
     # 拆分逻辑 - 先并行提取所有页面的 OCR，再构建项目
 
-    # 步骤1: 并行提取所有页面的 OCR（最多 3 个并发）
-    logger.info(f"[OCR并行] 开始并行提取 {total_pages} 页文本 (并发数: 3)...")
+    # 步骤1: 只对第一页进行 OCR（第一页是批件，后续页面是附件，仅需保存PDF）
+    logger.info(f"[OCR处理] 开始提取第 1 页文本（批件页）...")
     page_texts = {}
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        # 提交所有 OCR 任务
-        future_to_page = {}
-        for page_num in range(1, total_pages + 1):
-            temp_pdf = os.path.join(output_folder, f"temp_{page_num}.pdf")
-            create_pdf_pages(filepath, temp_pdf, [page_num], log_prefix=f"[页面 {page_num}/{total_pages}] ")
-            future = executor.submit(extract_textin_ocr, temp_pdf)
-            future_to_page[future] = (page_num, temp_pdf)
+    # 提取第一页并 OCR
+    temp_pdf = os.path.join(output_folder, "temp_1.pdf")
+    create_pdf_pages(filepath, temp_pdf, [1], log_prefix=f"[页面 1/{total_pages}] ")
+    page_texts[1] = extract_textin_ocr(temp_pdf)
+    if os.path.exists(temp_pdf):
+        os.remove(temp_pdf)
 
-        # 收集结果
-        for future in as_completed(future_to_page):
-            page_num, temp_pdf = future_to_page[future]
-            try:
-                page_texts[page_num] = future.result()
-                if os.path.exists(temp_pdf):
-                    os.remove(temp_pdf)
-            except Exception as e:
-                logger.error(f"[OCR错误] 页面 {page_num} 提取失败: {e}")
-                page_texts[page_num] = ""
-
-    logger.info(f"[OCR并行] 完成，共提取 {len(page_texts)} 页文本")
+    logger.info(f"[OCR完成] 第一页文本提取完成，后续页面作为附件无需 OCR")
 
     # 步骤2: 简化拆分逻辑 - 第一页作为主文件，后续页面作为附件
     # 构建单个项目
